@@ -1,6 +1,6 @@
-# Chaptgpt分流规则
+# Chaptgpt及自定义分流规则
 
-因Chatgpt香港节点不支持，所以独立创建了一份openclash分流规则
+因Chatgpt香港节点不支持，所以独立创建了一份openclash分流规则；Custom是自定义规则，可以在Full.ini中更改到自己的list
 
 基础规则：ACL4SSR_Online_Full 全分组重度用户使用(与Github同步)  致谢：ACL4SSR
 
