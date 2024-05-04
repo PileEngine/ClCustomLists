@@ -10,6 +10,7 @@ DOMAIN-SUFFIX,platform.openai.com
 DOMAIN-SUFFIX,oaistatic.com
 DOMAIN-SUFFIX,oaiusercontent.com
 DOMAIN-SUFFIX,livekit.cloud
+DOMAIN-SUFFIX,chatgpt.com
 # Add ai.com
 DOMAIN-SUFFIX,ai.com
 # Add stripe.com
