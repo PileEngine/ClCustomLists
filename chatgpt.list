@@ -9,7 +9,7 @@ DOMAIN-SUFFIX,auth0.openai.com
 DOMAIN-SUFFIX,platform.openai.com
 DOMAIN-SUFFIX,oaistatic.com
 DOMAIN-SUFFIX,oaiusercontent.com
-# DOMAIN-SUFFIX,livekit.cloud
+DOMAIN-SUFFIX,livekit.cloud
 DOMAIN-SUFFIX,chatgpt.com
 DOMAIN-SUFFIX,intercom.io
 DOMAIN-SUFFIX,intercomcdn.com
