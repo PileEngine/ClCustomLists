@@ -34,3 +34,5 @@ DOMAIN-SUFFIX,poe.com
 DOMAIN-SUFFIX,bard.google.com
 #add claude.ai
 DOMAIN-SUFFIX,claude.ai
+#add perplexity
+DOMAIN-SUFFIX,perplexity.ai
