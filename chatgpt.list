@@ -36,3 +36,4 @@ DOMAIN-SUFFIX,bard.google.com
 DOMAIN-SUFFIX,claude.ai
 #add perplexity
 DOMAIN-SUFFIX,perplexity.ai
+DOMAIN-SUFFIX,lumalabs.ai
