@@ -4,4 +4,4 @@ DOMAIN-SUFFIX,akamaistream.net
 DOMAIN-SUFFIX,akamaized.net
 IP-CIDR,142.250.107.188/32,no-resolve
 IP-CIDR,74.125.27.188/32,no-resolve
-IP-CIDR,172.217.74.188/32,no-resolve
+IP-CIDR,142.250.107.188/32,no-resolve
