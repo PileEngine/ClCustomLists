@@ -1,0 +1,78 @@
+// FlClash (mihomo >= v1.19.27) 脚本覆写：内嵌 Tailscale 出站
+// 原理：mihomo 原生 type: tailscale 节点基于 tsnet，纯用户态（gVisor）加入 tailnet，
+// 不需要系统单独跑 tailscaled，也不需要开 TUN。节点建好后像普通代理节点一样
+// 被 proxy-groups / rules 引用即可。
+// 前提：FlClash 设置里确认核心版本 >= 1.19.27（低于此版本没有这个出站类型）。
+// 使用方法：FlClash -> 配置 -> 该订阅右上角"脚本" -> 粘贴本文件全部内容，
+// 并把下面 TAILSCALE_AUTH_KEY 换成你自己在 Tailscale 后台生成的 auth key。
+
+function main(config) {
+  // ========== 按需修改 ==========
+  const NODE_NAME = "Tailscale";
+  const TAILSCALE_AUTH_KEY = "tskey-auth-xxxxxxxxxxxx"; // 换成你的 auth key（建议用可复用的 reusable key）
+  const TAILSCALE_HOSTNAME = "flclash-node";            // 在 tailnet 里显示的设备名
+  // const HEADSCALE_URL = "https://headscale.example.com"; // 自建 Headscale 就取消下面 control-url 的注释
+  // ===============================
+
+  // ---------- 1. 添加 Tailscale 出站节点 ----------
+  if (!Array.isArray(config.proxies)) config.proxies = [];
+
+  if (!config.proxies.some((p) => p.name === NODE_NAME)) {
+    config.proxies.push({
+      name: NODE_NAME,
+      type: "tailscale",
+      "auth-key": TAILSCALE_AUTH_KEY,
+      hostname: TAILSCALE_HOSTNAME,
+      udp: true,
+      "accept-routes": true, // 接受其他 tailnet 节点通告的子网路由（访问家里网段要开）
+      "state-dir": "tailscale-state", // 固定目录名，保证重启后 tailnet 身份不变，不用重新扫码认证
+      // "control-url": HEADSCALE_URL,
+    });
+  }
+
+  // ---------- 2. 挂进已有的手动选择/代理组，方便看状态、手动切换 ----------
+  if (Array.isArray(config["proxy-groups"])) {
+    config["proxy-groups"].forEach((g) => {
+      if (
+        (g.type === "select" || g.type === "url-test") &&
+        Array.isArray(g.proxies) &&
+        g.proxies.indexOf(NODE_NAME) === -1 &&
+        g.name !== NODE_NAME
+      ) {
+        // 只塞进"手动选择"这类主选择组，避免被塞进自动测速组里被健康检查探测干扰 tailnet 状态
+        if (g.type === "select") g.proxies.push(NODE_NAME);
+      }
+    });
+  }
+
+  // ---------- 3. 路由规则：tailnet 流量走 Tailscale 节点，而不是 DIRECT ----------
+  // 注意这里是走 NODE_NAME 这个出站，不是 DIRECT——DIRECT 走的是本机默认路由，
+  // 根本到不了 tailnet 内部地址；必须显式指定用这个出站拨号。
+  const tailscaleRules = [
+    `IP-CIDR,100.64.0.0/10,${NODE_NAME},no-resolve`, // Tailscale CGNAT 网段（含 100.100.100.100 MagicDNS）
+    `DOMAIN-SUFFIX,ts.net,${NODE_NAME}`,             // tailnet 内部 MagicDNS 主机名
+  ];
+  const oldRules = Array.isArray(config.rules) ? config.rules : [];
+  config.rules = tailscaleRules.concat(
+    oldRules.filter((r) => tailscaleRules.indexOf(r) === -1)
+  );
+
+  // ---------- 4. DNS：ts.net 域名必须经由 Tailscale 出站查询 MagicDNS ----------
+  // "#NODE_NAME" 后缀强制该条 DNS 查询走指定出站拨号——只有通过 tailscale 出站
+  // 才能连上 100.100.100.100 这个 tailnet 内部解析器。
+  if (!config.dns) config.dns = {};
+
+  if (!Array.isArray(config.dns["fake-ip-filter"])) {
+    config.dns["fake-ip-filter"] = [];
+  }
+  if (config.dns["fake-ip-filter"].indexOf("+.ts.net") === -1) {
+    config.dns["fake-ip-filter"].push("+.ts.net");
+  }
+
+  if (!config.dns["nameserver-policy"] || typeof config.dns["nameserver-policy"] !== "object") {
+    config.dns["nameserver-policy"] = {};
+  }
+  config.dns["nameserver-policy"]["+.ts.net"] = `100.100.100.100#${NODE_NAME}`;
+
+  return config;
+}
