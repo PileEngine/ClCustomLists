@@ -74,5 +74,25 @@ function main(config) {
   }
   config.dns["nameserver-policy"]["+.ts.net"] = `100.100.100.100#${NODE_NAME}`;
 
+  // ---------- 5. 别名（短名，不带 ts.net 后缀）访问 ----------
+  // 官方客户端能直接打短名，是因为它往系统里加了一条 search 域，
+  // OS 自己把 "nas" 补全成 "nas.<tailnet>.ts.net" 再发出查询。
+  // mihomo 内嵌 tsnet 时系统里没有这层，裸短名查询不会命中上面 "+.ts.net" 的后缀规则，
+  // 所以改用静态 hosts 直接把短名钉死到设备的 tailnet IP（在 Tailscale 后台 Machines 页面能查到，
+  // 这个 IP 一般不会变），完全绕开 DNS，比赌 MagicDNS 会不会解析裸短名更可靠。
+  const TAILNET_HOSTS = {
+    // "短名": "100.x.y.z",   <- 把你的设备名和对应的 tailnet IP 填进来，可以加任意多条
+    // "nas": "100.101.102.103",
+    // "router": "100.101.102.104",
+  };
+
+  if (Object.keys(TAILNET_HOSTS).length > 0) {
+    if (!config.hosts || typeof config.hosts !== "object") config.hosts = {};
+    Object.keys(TAILNET_HOSTS).forEach((name) => {
+      config.hosts[name] = TAILNET_HOSTS[name];
+    });
+    config.dns["use-hosts"] = true; // 不开这个 hosts 映射不会生效
+  }
+
   return config;
 }
