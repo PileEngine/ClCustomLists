@@ -1,3 +1,4 @@
+// 有问题，暂时用不了
 // FlClash (mihomo >= v1.19.27) 脚本覆写：内嵌 Tailscale 出站增强版
 // 支持：MagicDNS 域名解析、短名 hosts 映射、IPv4/IPv6 全网段路由、Subnet 路由自动分流
 
