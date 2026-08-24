@@ -1,0 +1,108 @@
+// FlClash (mihomo >= v1.19.27) 脚本覆写：内嵌 Tailscale 出站
+// 原理：mihomo 原生 type: tailscale 节点基于 tsnet 用户态协议栈（gVisor）接入 tailnet。
+
+function main(config) {
+  // ==================== 1. 用户自定义配置区 ====================
+  const NODE_NAME = "Tailscale";
+  const TAILSCALE_AUTH_KEY = "tskey-auth-xxxxxxxxxxxx"; // 建议使用 Reusable（可复用）且非 Ephemeral 的 Key
+  const TAILSCALE_HOSTNAME = "flclash-node";            // Tailnet 内显示的设备名
+  // const HEADSCALE_URL = "https://headscale.example.com"; // 自建 Headscale 取消注释并填入地址
+
+  // 对端节点通告的子网路由（如果不通过 Tailscale 访问对端内网网段，留空 [] 即可）
+  const SUBNET_ROUTES = [
+    // "192.168.1.0/24",
+    // "10.0.0.0/24",
+  ];
+
+  // 裸短名静态映射（解决 MagicDNS 裸短名无法自动补全 search 域的问题）
+  const TAILNET_HOSTS = {
+    // "nas": "100.101.102.103",
+    // "router": "100.101.102.104",
+  };
+  // =============================================================
+
+  // 安全初始化关键对象
+  if (!Array.isArray(config.proxies)) config.proxies = [];
+  if (!Array.isArray(config["proxy-groups"])) config["proxy-groups"] = [];
+  if (!Array.isArray(config.rules)) config.rules = [];
+  if (!config.dns || typeof config.dns !== "object") config.dns = {};
+  if (!Array.isArray(config.dns["fake-ip-filter"])) config.dns["fake-ip-filter"] = [];
+  if (!config.dns["nameserver-policy"] || typeof config.dns["nameserver-policy"] !== "object") {
+    config.dns["nameserver-policy"] = {};
+  }
+
+  // ---------- 2. 添加 Tailscale 出站节点 ----------
+  const existingNodeIndex = config.proxies.findIndex((p) => p.name === NODE_NAME);
+  const tailscaleNodeConfig = {
+    name: NODE_NAME,
+    type: "tailscale",
+    "auth-key": TAILSCALE_AUTH_KEY,
+    hostname: TAILSCALE_HOSTNAME,
+    udp: true,
+    "accept-routes": true,         // 接收其他节点通告的子网路由
+    "state-dir": "tailscale-state", // 持久化凭据目录，保持 Tailnet 身份稳定
+    ephemeral: false,              // 必须为 false：避免离线后被控制端注销导致本地持久化凭据失效
+    // "control-url": HEADSCALE_URL,
+  };
+
+  if (existingNodeIndex === -1) {
+    config.proxies.push(tailscaleNodeConfig);
+  } else {
+    config.proxies[existingNodeIndex] = tailscaleNodeConfig;
+  }
+
+  // ---------- 3. 注入代理策略组 ----------
+  // 仅注入到手动选择组（select）或全局组，避免被 url-test 频繁健康检查触发不必要的握手
+  config["proxy-groups"].forEach((group) => {
+    if (
+      group.type === "select" &&
+      Array.isArray(group.proxies) &&
+      group.name !== NODE_NAME &&
+      !group.proxies.includes(NODE_NAME)
+    ) {
+      group.proxies.push(NODE_NAME);
+    }
+  });
+
+  // ---------- 4. 路由规则注入 ----------
+  const tailscaleRules = [
+    `IP-CIDR,100.64.0.0/10,${NODE_NAME},no-resolve`, // Tailscale CGNAT 默认网段
+    `DOMAIN-SUFFIX,ts.net,${NODE_NAME}`,             // Tailscale 内部 MagicDNS 域名
+  ];
+
+  // 注入子网路由规则（保证优先级高于原配置中的局域网直连规则）
+  SUBNET_ROUTES.forEach((cidr) => {
+    tailscaleRules.push(`IP-CIDR,${cidr},${NODE_NAME},no-resolve`);
+  });
+
+  // 将 Tailscale 规则置顶，避免被后续的 GEOIP/LAN DIRECT 规则截断
+  config.rules = [
+    ...tailscaleRules,
+    ...config.rules.filter((rule) => !tailscaleRules.includes(rule)),
+  ];
+
+  // ---------- 5. DNS 与 Fake-IP 过滤 ----------
+  // 忽略 MagicDNS 域名的 Fake-IP 分配，确保返回真实 100.x.y.z 地址触发路由
+  if (!config.dns["fake-ip-filter"].includes("+.ts.net")) {
+    config.dns["fake-ip-filter"].push("+.ts.net");
+  }
+
+  // 指定 ts.net 域名走 Tailscale 节点向 MagicDNS 查询
+  config.dns["nameserver-policy"]["+.ts.net"] = `100.100.100.100#${NODE_NAME}`;
+
+  // ---------- 6. 裸短名（Hosts）映射 ----------
+  const hostKeys = Object.keys(TAILNET_HOSTS);
+  if (hostKeys.length > 0) {
+    if (!config.hosts || typeof config.hosts !== "object") config.hosts = {};
+    hostKeys.forEach((name) => {
+      config.hosts[name] = TAILNET_HOSTS[name];
+      // 避免短名被误赋予 Fake-IP 导致无法直接按 IP 匹配路由
+      if (!config.dns["fake-ip-filter"].includes(name)) {
+        config.dns["fake-ip-filter"].push(name);
+      }
+    });
+    config.dns["use-hosts"] = true;
+  }
+
+  return config;
+}
