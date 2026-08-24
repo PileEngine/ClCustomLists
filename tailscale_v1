@@ -1,113 +1,78 @@
-// FlClash (mihomo >= v1.19.27) 脚本覆写：内嵌 Tailscale 出站
-// 原理：mihomo 原生 type: tailscale 节点基于 tsnet，纯用户态（gVisor）加入 tailnet，
-// 不需要系统单独跑 tailscaled，也不需要开 TUN。节点建好后像普通代理节点一样
-// 被 proxy-groups / rules 引用即可。
-// 前提：FlClash 设置里确认核心版本 >= 1.19.27（低于此版本没有这个出站类型）。
-// 使用方法：FlClash -> 配置 -> 该订阅右上角"脚本" -> 粘贴本文件全部内容，
-// 并把下面 TAILSCALE_AUTH_KEY 换成你自己在 Tailscale 后台生成的 auth key。
-
+/**
+ * Mihomo 内核 Tailscale 注入与 MagicDNS 覆写脚本
+ * 适用环境：Clash Verge Rev / Mihomo Party / Clash Nyanpasu 扩展脚本
+ */
 function main(config) {
-  // ========== 按需修改 ==========
-  const NODE_NAME = "Tailscale";
-  const TAILSCALE_AUTH_KEY = "tskey-auth-xxxxxxxxxxxx"; // 换成你的 auth key（建议用可复用的 reusable key）
-  const TAILSCALE_HOSTNAME = "flclash-node";            // 在 tailnet 里显示的设备名
-  // const HEADSCALE_URL = "https://headscale.example.com"; // 自建 Headscale 就取消下面 control-url 的注释
-  // 其他 tailnet 节点用 `tailscale up --advertise-routes=...` 广播出来的子网网段，
-  // 填在这里 accept-routes 才有实际意义——否则订阅规则集里常见的
-  // "GEOIP,LAN,DIRECT" / "IP-CIDR,192.168.0.0/16,DIRECT" 这类规则会先一步把
-  // 这些私网 IP 判定为直连，流量根本走不到 Tailscale 节点。
-  const SUBNET_ROUTES = [
-    // "192.168.1.0/24", // 例如家里广播出来的局域网段，可以加任意多条
-  ];
-  // ===============================
+  // 1. 配置参数常量
+  const TAILSCALE_CONFIG = {
+    proxyName: "Tailscale-Node",                  // 代理节点名称
+    hostname: "mihomo-client",                   // 注册到 Tailscale 控制台的设备名
+    authKey: "tskey-auth-xxxxxxxxxxxx",          // 替换为 Tailscale Auth Key (需设置为 Reusable & Pre-Approved)
+    controlUrl: "https://controlplane.tailscale.com", // 自建 Headscale 用户可替换为对应 URL
+    stateDir: "./tailscale-state",               // 持久化存储目录（存储设备密钥与认证状态，重启不重复注册）
+    ephemeral: false,                            // false: 设备长期保留；true: 离线自动注销
+    tailnetSuffix: "+.ts.net",                   // 你的 Tailnet 域名后缀（如: +.your-domain.ts.net）
+    magicDnsIp: "100.100.100.100"                // Tailscale MagicDNS 默认 DNS 服务器 IP
+  };
 
-  // ---------- 1. 添加 Tailscale 出站节点 ----------
-  if (!Array.isArray(config.proxies)) config.proxies = [];
+  // 2. 构造 Tailscale Proxy 节点
+  const tailscaleProxy = {
+    name: TAILSCALE_CONFIG.proxyName,
+    type: "tailscale",
+    hostname: TAILSCALE_CONFIG.hostname,
+    "auth-key": TAILSCALE_CONFIG.authKey,
+    "control-url": TAILSCALE_CONFIG.controlUrl,
+    "state-dir": TAILSCALE_CONFIG.stateDir,
+    ephemeral: TAILSCALE_CONFIG.ephemeral,
+    udp: true
+  };
 
-  if (!config.proxies.some((p) => p.name === NODE_NAME)) {
-    config.proxies.push({
-      name: NODE_NAME,
-      type: "tailscale",
-      "auth-key": TAILSCALE_AUTH_KEY,
-      hostname: TAILSCALE_HOSTNAME,
-      udp: true,
-      "accept-routes": true, // 接受其他 tailnet 节点通告的子网路由（访问家里网段要开，见下面 SUBNET_ROUTES）
-      "state-dir": "tailscale-state", // 固定目录名，保证重启后 tailnet 身份不变，不用重新扫码认证
-      // 注意：不要加 ephemeral: true——它和 state-dir 的目的正相反（ephemeral 节点断线即被
-      // 控制端注销，重连即视为"新节点"，state-dir 里存的旧身份反而用不上）。两者不能共存。
-      // 如果切网络后出现 "Multiple cloned devices are trying to share a key. Reinstall."，
-      // 去 https://login.tailscale.com/admin/machines 删掉冲突的旧设备条目，必要时把
-      // state-dir 改个新名字重新注册，而不是靠 ephemeral 去"绕过"这个问题。
-      // "control-url": HEADSCALE_URL,
-    });
+  // 3. 注入 Proxy 节点列表
+  if (!Array.isArray(config.proxies)) {
+    config.proxies = [];
   }
+  // 过滤掉同名节点，避免热重载重复注入
+  config.proxies = config.proxies.filter(p => p.name !== TAILSCALE_CONFIG.proxyName);
+  config.proxies.push(tailscaleProxy);
 
-  // ---------- 2. 挂进已有的手动选择/代理组，方便看状态、手动切换 ----------
+  // 4. 将 Tailscale 节点追加到策略组（可选，方便手动切换或分流）
   if (Array.isArray(config["proxy-groups"])) {
-    config["proxy-groups"].forEach((g) => {
-      if (
-        (g.type === "select" || g.type === "url-test") &&
-        Array.isArray(g.proxies) &&
-        g.proxies.indexOf(NODE_NAME) === -1 &&
-        g.name !== NODE_NAME
-      ) {
-        // 只塞进"手动选择"这类主选择组，避免被塞进自动测速组里被健康检查探测干扰 tailnet 状态
-        if (g.type === "select") g.proxies.push(NODE_NAME);
+    config["proxy-groups"].forEach(group => {
+      if (["GLOBAL", "PROXY", "节点选择", "FINAL"].includes(group.name)) {
+        if (Array.isArray(group.proxies) && !group.proxies.includes(TAILSCALE_CONFIG.proxyName)) {
+          group.proxies.push(TAILSCALE_CONFIG.proxyName);
+        }
       }
     });
   }
 
-  // ---------- 3. 路由规则：tailnet 流量走 Tailscale 节点，而不是 DIRECT ----------
-  // 注意这里是走 NODE_NAME 这个出站，不是 DIRECT——DIRECT 走的是本机默认路由，
-  // 根本到不了 tailnet 内部地址；必须显式指定用这个出站拨号。
-  const tailscaleRules = [
-    `IP-CIDR,100.64.0.0/10,${NODE_NAME},no-resolve`, // Tailscale CGNAT 网段（含 100.100.100.100 MagicDNS）
-    `DOMAIN-SUFFIX,ts.net,${NODE_NAME}`,             // tailnet 内部 MagicDNS 主机名
-  ].concat(
-    // 子网路由要放在规则表最前面，才能抢在订阅自带的 LAN 直连规则之前命中
-    SUBNET_ROUTES.map((cidr) => `IP-CIDR,${cidr},${NODE_NAME},no-resolve`)
-  );
-  const oldRules = Array.isArray(config.rules) ? config.rules : [];
-  config.rules = tailscaleRules.concat(
-    oldRules.filter((r) => tailscaleRules.indexOf(r) === -1)
-  );
-
-  // ---------- 4. DNS：ts.net 域名必须经由 Tailscale 出站查询 MagicDNS ----------
-  // "#NODE_NAME" 后缀强制该条 DNS 查询走指定出站拨号——只有通过 tailscale 出站
-  // 才能连上 100.100.100.100 这个 tailnet 内部解析器。
-  if (!config.dns) config.dns = {};
-
-  if (!Array.isArray(config.dns["fake-ip-filter"])) {
-    config.dns["fake-ip-filter"] = [];
+  // 5. 配置 DNS 自定义域名解析 (MagicDNS 路由)
+  if (!config.dns) {
+    config.dns = { enable: true };
   }
-  if (config.dns["fake-ip-filter"].indexOf("+.ts.net") === -1) {
-    config.dns["fake-ip-filter"].push("+.ts.net");
-  }
-
-  if (!config.dns["nameserver-policy"] || typeof config.dns["nameserver-policy"] !== "object") {
+  if (!config.dns["nameserver-policy"]) {
     config.dns["nameserver-policy"] = {};
   }
-  config.dns["nameserver-policy"]["+.ts.net"] = `100.100.100.100#${NODE_NAME}`;
+  
+  // 将 Tailnet 设备域名 (*.ts.net) 路由至 Tailscale 内置 MagicDNS 解析
+  config.dns["nameserver-policy"][TAILSCALE_CONFIG.tailnetSuffix] = TAILSCALE_CONFIG.magicDnsIp;
 
-  // ---------- 5. 别名（短名，不带 ts.net 后缀）访问 ----------
-  // 官方客户端能直接打短名，是因为它往系统里加了一条 search 域，
-  // OS 自己把 "nas" 补全成 "nas.<tailnet>.ts.net" 再发出查询。
-  // mihomo 内嵌 tsnet 时系统里没有这层，裸短名查询不会命中上面 "+.ts.net" 的后缀规则，
-  // 所以改用静态 hosts 直接把短名钉死到设备的 tailnet IP（在 Tailscale 后台 Machines 页面能查到，
-  // 这个 IP 一般不会变），完全绕开 DNS，比赌 MagicDNS 会不会解析裸短名更可靠。
-  const TAILNET_HOSTS = {
-    // "短名": "100.x.y.z",   <- 把你的设备名和对应的 tailnet IP 填进来，可以加任意多条
-    // "nas": "100.101.102.103",
-    // "router": "100.101.102.104",
-  };
+  // 6. 注入分流规则（保证匹配 MagicDNS 与 Tailscale CGNAT 网段流量走 Tailscale 节点）
+  const tailscaleRules = [
+    // 拦截 MagicDNS 查询及 Tailscale 内网 CGNAT 目标 IP (100.64.0.0/10)
+    `IP-CIDR,100.64.0.0/10,${TAILSCALE_CONFIG.proxyName},no-resolve`,
+    // 拦截 Tailnet 自定义设备域名后缀，走 Tailscale 节点转发
+    `DOMAIN-SUFFIX,ts.net,${TAILSCALE_CONFIG.proxyName}`,
+    // 控制平面域名直连，防止建立隧道时出现死循环
+    "DOMAIN-SUFFIX,tailscale.com,DIRECT",
+    "DOMAIN-SUFFIX,tailscale.io,DIRECT"
+  ];
 
-  if (Object.keys(TAILNET_HOSTS).length > 0) {
-    if (!config.hosts || typeof config.hosts !== "object") config.hosts = {};
-    Object.keys(TAILNET_HOSTS).forEach((name) => {
-      config.hosts[name] = TAILNET_HOSTS[name];
-    });
-    config.dns["use-hosts"] = true; // 不开这个 hosts 映射不会生效
+  if (!Array.isArray(config.rules)) {
+    config.rules = [];
   }
+  // 插入到规则首部，确保最高优先级匹配
+  config.rules = [...tailscaleRules, ...config.rules];
 
   return config;
 }
