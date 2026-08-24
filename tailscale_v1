@@ -5,7 +5,7 @@ function main(config) {
   // ==================== 用户配置区 ====================
   const NODE_NAME = "Tailscale";
   const TAILSCALE_AUTH_KEY = "tskey-auth-xxxxxxxxxxxx"; // 建议使用 Reusable / Pre-authorized Key
-  const TAILSCALE_HOSTNAME = "flclash-node";             // 在 Tailnet 中显示的设备名
+  const TAILSCALE_HOSTNAME = "flclash-node-test1";             // 在 Tailnet 中显示的设备名
   
   // 自建 Headscale 节点（如使用官方 Tailscale 请保持为 null）
   const HEADSCALE_CONTROL_URL = null; // 例："https://headscale.example.com"
