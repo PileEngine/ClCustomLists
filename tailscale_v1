@@ -1,127 +1,115 @@
-// FlClash (mihomo >= v1.19.27) 脚本覆写：内嵌 Tailscale 出站强化版
-// 原理：mihomo 原生 type: tailscale 节点基于 tsnet 运行在用户态，
-// 无需系统级 TUN 即可加入 tailnet，支持 MagicDNS 与子网路由。
+// FlClash (mihomo >= v1.19.27) 脚本覆写：内嵌 Tailscale 出站增强版
+// 支持：MagicDNS 域名解析、短名 hosts 映射、IPv4/IPv6 全网段路由、Subnet 路由自动分流
 
 function main(config) {
-  // ==================== 1. 用户配置区 ====================
+  // ==================== 用户配置区 ====================
   const NODE_NAME = "Tailscale";
-  const TAILSCALE_AUTH_KEY = "tskey-auth-xxxxxxxxxxxx"; // 替换为你的 Auth Key (建议 Pre-authenticated / Reusable)
-  const TAILSCALE_HOSTNAME = "flclash-node-test0";             // 设备在 Tailnet 中显示的 Hostname
-  // const HEADSCALE_URL = "https://headscale.example.com"; // 自建 Headscale 控制端地址（按需开启）
+  const TAILSCALE_AUTH_KEY = "tskey-auth-xxxxxxxxxxxx"; // 建议使用 Reusable / Pre-authorized Key
+  const TAILSCALE_HOSTNAME = "flclash-node";             // 在 Tailnet 中显示的设备名
+  
+  // 自建 Headscale 节点（如使用官方 Tailscale 请保持为 null）
+  const HEADSCALE_CONTROL_URL = null; // 例："https://headscale.example.com"
 
-  // 短名静态解析映射：将短名直接钉死到对应的 Tailscale IP
-  const TAILNET_HOSTS = {
-    // "nas": "100.101.102.103",
-    // "pve": "100.101.102.104",
-  };
+  // 指定出口节点（Exit Node，不需要留空即可）
+  const EXIT_NODE_NAME = ""; // 例："home-nas"
 
-  // 子网路由（Subnet Router）网段：若家中节点通告了内网网段，填在此处强制走 Tailscale
-  const SUBNET_ROUTES = [
+  // 远端 Tailnet 子网路由（若远端开启了 Subnet Router，填入需要访问的内网网段）
+  const TAILSCALE_SUBNET_ROUTES = [
     // "192.168.1.0/24",
-    // "10.0.0.0/24",
+    // "10.0.0.0/8",
   ];
 
-  // 策略组黑名单：不希望注入 Tailscale 节点的策略组名称关键词
-  const EXCLUDE_GROUPS = ["自动", "Auto", "DIRECT", "直连", "漏网之鱼"];
-  // =======================================================
+  // 设备短名静态映射（直接解析短名，避免依赖 search 域）
+  const TAILNET_HOSTS = {
+    // "nas": "100.101.102.103",
+    // "router": "100.101.102.104",
+  };
+  // ===================================================
 
-
-  // ==================== 2. 注入 Tailscale 节点 ====================
-  if (!Array.isArray(config.proxies)) {
-    config.proxies = [];
+  // 1. 初始化基础对象容器
+  if (!Array.isArray(config.proxies)) config.proxies = [];
+  if (!Array.isArray(config["proxy-groups"])) config["proxy-groups"] = [];
+  if (!config.dns || typeof config.dns !== "object") config.dns = {};
+  if (!Array.isArray(config.dns["fake-ip-filter"])) config.dns["fake-ip-filter"] = [];
+  if (!config.dns["nameserver-policy"] || typeof config.dns["nameserver-policy"] !== "object") {
+    config.dns["nameserver-policy"] = {};
   }
 
-  const existingNodeIndex = config.proxies.findIndex((p) => p.name === NODE_NAME);
-  const tailscaleNodeConfig = {
-    name: NODE_NAME,
+  // 2. 构建并添加 Tailscale 出站节点
+  const tailscaleProxy = {
+    name: NODE_NAME_1,
     type: "tailscale",
     "auth-key": TAILSCALE_AUTH_KEY,
     hostname: TAILSCALE_HOSTNAME,
     udp: true,
-    "accept-routes": true,         // 接受 Subnet Router 通告的路由
-    "state-dir": "tailscale-state",// 持久化节点状态，避免重启后重新认证
-    // "control-url": HEADSCALE_URL,
+    "accept-routes": true,         // 接受子网路由
+    "state-dir": "tailscale-state", // 保证重启后身份密钥不丢失
   };
 
-  if (existingNodeIndex === -1) {
-    config.proxies.push(tailscaleNodeConfig);
+  if (HEADSCALE_CONTROL_URL) {
+    tailscaleProxy["control-url"] = HEADSCALE_CONTROL_URL;
+  }
+  if (EXIT_NODE_NAME) {
+    tailscaleProxy["exit-node"] = EXIT_NODE_NAME;
+    tailscaleProxy["exit-node-allow-lan-access"] = true;
+  }
+
+  const existingProxyIdx = config.proxies.findIndex((p) => p.name === NODE_NAME);
+  if (existingProxyIdx !== -1) {
+    config.proxies[existingProxyIdx] = tailscaleProxy;
   } else {
-    config.proxies[existingNodeIndex] = tailscaleNodeConfig;
+    config.proxies.push(tailscaleProxy);
   }
 
+  // 3. 注入代理组（仅注入 select 手动选择组，防止被测速探测干扰）
+  config["proxy-groups"].forEach((group) => {
+    if (
+      group.type === "select" &&
+      Array.isArray(group.proxies) &&
+      !group.proxies.includes(NODE_NAME) &&
+      group.name !== NODE_NAME
+    ) {
+      group.proxies.push(NODE_NAME);
+    }
+  });
 
-  // ==================== 3. 挂载到策略组 ====================
-  if (Array.isArray(config["proxy-groups"])) {
-    config["proxy-groups"].forEach((group) => {
-      // 仅挂载到手动选择组（select），且排除特定语义的策略组
-      const isSelectGroup = group.type === "select";
-      const isNotExcluded = !EXCLUDE_GROUPS.some((keyword) => group.name.includes(keyword));
-      const notSelf = group.name !== NODE_NAME;
-
-      if (isSelectGroup && isNotExcluded && notSelf && Array.isArray(group.proxies)) {
-        if (!group.proxies.includes(NODE_NAME)) {
-          group.proxies.push(NODE_NAME);
-        }
-      }
-    });
-  }
-
-
-  // ==================== 4. 路由分流规则注入 ====================
+  // 4. 配置分流路由规则
   const tailscaleRules = [
-    // Tailscale IPv4 CGNAT 地址段
-    `IP-CIDR,100.64.0.0/10,${NODE_NAME},no-resolve`,
-    // Tailscale IPv6 地址段（防止 IPv6 流量泄漏）
-    `IP-CIDR6,fd7a:115c:a1e0::/48,${NODE_NAME},no-resolve`,
-    // MagicDNS 完整域名后缀
-    `DOMAIN-SUFFIX,ts.net,${NODE_NAME}`,
+    `IP-CIDR,100.64.0.0/10,${NODE_NAME},no-resolve`,       // Tailscale IPv4 CGNAT 网段及 MagicDNS (100.100.100.100)
+    `IP-CIDR6,fd7a:115c:a1e0::/48,${NODE_NAME},no-resolve`,// Tailscale IPv6 ULA 网段
+    `DOMAIN-SUFFIX,ts.net,${NODE_NAME}`,                   // MagicDNS 域名
   ];
 
-  // 注入 Subnet Router 子网路由规则
-  SUBNET_ROUTES.forEach((cidr) => {
+  // 动态追加子网路由规则
+  TAILSCALE_SUBNET_ROUTES.forEach((cidr) => {
     tailscaleRules.push(`IP-CIDR,${cidr},${NODE_NAME},no-resolve`);
   });
 
-  const originalRules = Array.isArray(config.rules) ? config.rules : [];
-  // 确保 Tailscale 路由置顶生效，并过滤掉已有的重复规则
+  const oldRules = Array.isArray(config.rules) ? config.rules : [];
+  // 确保 Tailscale 规则置顶优先匹配，剔除旧规则中的重复项
   config.rules = tailscaleRules.concat(
-    originalRules.filter((rule) => !tailscaleRules.includes(rule))
+    oldRules.filter((r) => !tailscaleRules.includes(r))
   );
 
-
-  // ==================== 5. DNS 与 Fake-IP 策略 ====================
-  if (!config.dns || typeof config.dns !== "object") {
-    config.dns = {};
+  // 5. 配置 DNS（MagicDNS 解析与 Fake-IP 过滤）
+  if (!config.dns["fake-ip-filter"].includes("+.ts.net")) {
+    config.dns["fake-ip-filter"].push("+.ts.net");
   }
-
-  // 初始化 fake-ip-filter，防止内网域名被映射为 Fake-IP
-  if (!Array.isArray(config.dns["fake-ip-filter"])) {
-    config.dns["fake-ip-filter"] = [];
-  }
-  const fakeIpFilters = ["+.ts.net", ...Object.keys(TAILNET_HOSTS)];
-  fakeIpFilters.forEach((filterDomain) => {
-    if (!config.dns["fake-ip-filter"].includes(filterDomain)) {
-      config.dns["fake-ip-filter"].push(filterDomain);
-    }
-  });
-
-  // 配置 MagicDNS 解析策略（通过 Tailscale 出站查询内部 DNS 100.100.100.100）
-  if (!config.dns["nameserver-policy"] || typeof config.dns["nameserver-policy"] !== "object") {
-    config.dns["nameserver-policy"] = {};
-  }
+  // 强制 *.ts.net 的解析请求经由 Tailscale 出站访问 MagicDNS
   config.dns["nameserver-policy"]["+.ts.net"] = `100.100.100.100#${NODE_NAME}`;
 
-
-  // ==================== 6. 短名 Hosts 静态绑定 ====================
+  // 6. 配置短名 Hosts 映射
   const hostKeys = Object.keys(TAILNET_HOSTS);
   if (hostKeys.length > 0) {
-    if (!config.hosts || typeof config.hosts !== "object") {
-      config.hosts = {};
-    }
+    if (!config.hosts || typeof config.hosts !== "object") config.hosts = {};
     hostKeys.forEach((name) => {
       config.hosts[name] = TAILNET_HOSTS[name];
+      // 将短名加入 fake-ip-filter，确保直接返回真实 tailnet IP
+      if (!config.dns["fake-ip-filter"].includes(name)) {
+        config.dns["fake-ip-filter"].push(name);
+      }
     });
-    config.dns["use-hosts"] = true; // 确保 hosts 规则生效
+    config.dns["use-hosts"] = true;
   }
 
   return config;
