@@ -1,15 +1,23 @@
-// FlClash (mihomo >= v1.19.27) 脚本覆写：内嵌 Tailscale 出站 (支持短域名自动解析)
+// FlClash (mihomo >= v1.19.27) 脚本覆写：内嵌 Tailscale 出站
+// 原理：mihomo 原生 type: tailscale 节点基于 tsnet，纯用户态（gVisor）加入 tailnet，
+// 不需要系统单独跑 tailscaled，也不需要开 TUN。节点建好后像普通代理节点一样
+// 被 proxy-groups / rules 引用即可。
+// 前提：FlClash 设置里确认核心版本 >= 1.19.27（低于此版本没有这个出站类型）。
+// 使用方法：FlClash -> 配置 -> 该订阅右上角"脚本" -> 粘贴本文件全部内容，
+// 并把下面 TAILSCALE_AUTH_KEY 换成你自己在 Tailscale 后台生成的 auth key。
 
 function main(config) {
   // ========== 按需修改 ==========
   const NODE_NAME = "Tailscale";
-  const TAILSCALE_AUTH_KEY = "tskey-auth-xxxxxxxxxxxx"; // 换成你的 auth key
-  const TAILSCALE_HOSTNAME = "flclash-node-t0";            // 在 tailnet 里显示的设备名
+  const GROUP_NAME = "Tailscale 分流"; // 专用分流控制组的名字，可在 UI 里手动切换 Tailscale / DIRECT
+  const TAILSCALE_AUTH_KEY = "tskey-auth-xxxxxxxxxxxx"; // 换成你的 auth key（建议用可复用的 reusable key）
+  const TAILSCALE_HOSTNAME = "flclash-node";            // 在 tailnet 里显示的设备名
+  // const HEADSCALE_URL = "https://headscale.example.com"; // 自建 Headscale 就取消下面 control-url 的注释
   // ===============================
 
   // ---------- 1. 添加 Tailscale 出站节点 ----------
   if (!Array.isArray(config.proxies)) config.proxies = [];
-  
+
   if (!config.proxies.some((p) => p.name === NODE_NAME)) {
     config.proxies.push({
       name: NODE_NAME,
@@ -17,66 +25,86 @@ function main(config) {
       "auth-key": TAILSCALE_AUTH_KEY,
       hostname: TAILSCALE_HOSTNAME,
       udp: true,
-      "accept-routes": true, 
-      "state-dir": "tailscale-state",
+      "accept-routes": true, // 接受其他 tailnet 节点通告的子网路由（访问家里网段要开）
+      "state-dir": "tailscale-state", // 固定目录名，保证重启后 tailnet 身份不变，不用重新扫码认证
+      // "control-url": HEADSCALE_URL,
     });
   }
 
-  // ---------- 2. 将节点挂载进手动选择或代理组 ----------
-  if (Array.isArray(config["proxy-groups"])) {
-    config["proxy-groups"].forEach((g) => {
-      if (
-        (g.type === "select" || g.type === "url-test") &&
-        Array.isArray(g.proxies) &&
-        g.proxies.indexOf(NODE_NAME) === -1 &&
-        g.name !== NODE_NAME
-      ) {
-        if (g.type === "select") g.proxies.push(NODE_NAME);
-      }
+  // ---------- 2. 新建一个专用的分流控制组，而不是塞进订阅里所有的 select 组 ----------
+  // 之前的做法会把 Tailscale 节点注入每一个 select 组（包括"流媒体解锁""OpenAI"这类跟
+  // tailnet 毫无关系的业务组），菜单变乱，而且选中它在那些组里也访问不了对应服务。
+  // 改成单独建一个 GROUP_NAME 组，只在这里出现，路由规则也只指向这个组——
+  // 以后想临时切直连、加备用节点，UI 上点一下就行，不用碰脚本。
+  if (!Array.isArray(config["proxy-groups"])) config["proxy-groups"] = [];
+
+  const existingGroup = config["proxy-groups"].find((g) => g.name === GROUP_NAME);
+  if (existingGroup) {
+    if (!Array.isArray(existingGroup.proxies)) existingGroup.proxies = [];
+    if (existingGroup.proxies.indexOf(NODE_NAME) === -1) {
+      existingGroup.proxies.push(NODE_NAME);
+    }
+    if (existingGroup.proxies.indexOf("DIRECT") === -1) {
+      existingGroup.proxies.push("DIRECT");
+    }
+  } else {
+    config["proxy-groups"].push({
+      name: GROUP_NAME,
+      type: "select",
+      proxies: [NODE_NAME, "DIRECT"],
     });
   }
 
-  // ---------- 3. 定义短域名正则匹配规则 ----------
-  // 匹配所有不包含点号 `.` 的单标签域名（例如 nas, router, web 等）
-  const shortDomainRegex = "^[^.]+$";
-
-  // ---------- 4. 路由规则注入 ----------
+  // ---------- 3. 路由规则：tailnet 流量走 GROUP_NAME 这个分流组，而不是 DIRECT 或裸节点名 ----------
+  // 注意这里是走 GROUP_NAME 这个出站，不是 DIRECT——DIRECT 走的是本机默认路由，
+  // 根本到不了 tailnet 内部地址；必须显式指定用这个出站拨号。
   const tailscaleRules = [
-    `DOMAIN,localhost,DIRECT`,                           // 优先直连 localhost，防止系统保留短名被正则捕获并发送至 tailnet
-    `IP-CIDR,100.64.0.0/10,${NODE_NAME},no-resolve`,     // Tailscale CGNAT 官方网段
-    `DOMAIN-SUFFIX,ts.net,${NODE_NAME}`,                 // 完整 MagicDNS 域名直接走 Tailscale
-    `DOMAIN-REGEX,${shortDomainRegex},${NODE_NAME}`      // 【核心】拦截所有短域名，强制交由 Tailscale 出站处理
+    `IP-CIDR,100.64.0.0/10,${GROUP_NAME},no-resolve`, // Tailscale CGNAT 网段（含 100.100.100.100 MagicDNS）
+    `DOMAIN-SUFFIX,ts.net,${GROUP_NAME}`,              // tailnet 内部 MagicDNS 主机名
   ];
-  
   const oldRules = Array.isArray(config.rules) ? config.rules : [];
   config.rules = tailscaleRules.concat(
     oldRules.filter((r) => tailscaleRules.indexOf(r) === -1)
   );
 
-  // ---------- 5. DNS 配置深度劫持 ----------
+  // ---------- 4. DNS：ts.net 域名必须经由 Tailscale 出站查询 MagicDNS ----------
+  // "#NODE_NAME" 后缀强制该条 DNS 查询走指定出站拨号——只有通过 tailscale 出站
+  // 才能连上 100.100.100.100 这个 tailnet 内部解析器。这里仍然指定节点本身
+  // （而不是 GROUP_NAME），因为 DNS 查询必须固定走 tailscale 出站才能连到
+  // 100.100.100.100，不应该跟着分流组切到 DIRECT。
   if (!config.dns) config.dns = {};
 
-  // 5.1 过滤 Fake-IP：确保短域名获取的是 tailnet 的真实 100.x IP，避免与代理机制冲突
   if (!Array.isArray(config.dns["fake-ip-filter"])) {
     config.dns["fake-ip-filter"] = [];
   }
-  const fakeIpFilters = ["+.ts.net", `regex:${shortDomainRegex}`];
-  fakeIpFilters.forEach(filter => {
-    if (config.dns["fake-ip-filter"].indexOf(filter) === -1) {
-      config.dns["fake-ip-filter"].push(filter);
-    }
-  });
+  if (config.dns["fake-ip-filter"].indexOf("+.ts.net") === -1) {
+    config.dns["fake-ip-filter"].push("+.ts.net");
+  }
 
-  // 5.2 DNS 解析策略：强制短域名的 DNS 解析走 MagicDNS 
   if (!config.dns["nameserver-policy"] || typeof config.dns["nameserver-policy"] !== "object") {
     config.dns["nameserver-policy"] = {};
   }
-  
-  // 原有的 ts.net 后缀走 MagicDNS
   config.dns["nameserver-policy"]["+.ts.net"] = `100.100.100.100#${NODE_NAME}`;
-  // 【核心】不带后缀的短域名同样交由 MagicDNS 解析
-  config.dns["nameserver-policy"][`regex:${shortDomainRegex}`] = `100.100.100.100#${NODE_NAME}`;
 
-  // 由于实现了自动解析，不再需要强行写入 config.hosts
+  // ---------- 5. 别名（短名，不带 ts.net 后缀）访问 ----------
+  // 官方客户端能直接打短名，是因为它往系统里加了一条 search 域，
+  // OS 自己把 "nas" 补全成 "nas.<tailnet>.ts.net" 再发出查询。
+  // mihomo 内嵌 tsnet 时系统里没有这层，裸短名查询不会命中上面 "+.ts.net" 的后缀规则，
+  // 所以改用静态 hosts 直接把短名钉死到设备的 tailnet IP（在 Tailscale 后台 Machines 页面能查到，
+  // 这个 IP 一般不会变），完全绕开 DNS，比赌 MagicDNS 会不会解析裸短名更可靠。
+  const TAILNET_HOSTS = {
+    // "短名": "100.x.y.z",   <- 把你的设备名和对应的 tailnet IP 填进来，可以加任意多条
+    // "nas": "100.101.102.103",
+    // "router": "100.101.102.104",
+  };
+
+  if (Object.keys(TAILNET_HOSTS).length > 0) {
+    if (!config.hosts || typeof config.hosts !== "object") config.hosts = {};
+    Object.keys(TAILNET_HOSTS).forEach((name) => {
+      config.hosts[name] = TAILNET_HOSTS[name];
+    });
+    config.dns["use-hosts"] = true; // 不开这个 hosts 映射不会生效
+  }
+
   return config;
 }
