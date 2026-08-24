@@ -1,6 +1,4 @@
-// FlClash (mihomo >= v1.19.27) 脚本覆写：内嵌 Tailscale 出站
-// 原理：mihomo 原生 type: tailscale 节点基于 tsnet，纯用户态加入 tailnet。
-// 修复版：完善了 MagicDNS 的 UDP 代理查询语法与通配匹配规则。
+// FlClash (mihomo >= v1.19.27) 脚本覆写：内嵌 Tailscale 出站 (支持短域名自动解析)
 
 function main(config) {
   // ========== 按需修改 ==========
@@ -11,7 +9,7 @@ function main(config) {
 
   // ---------- 1. 添加 Tailscale 出站节点 ----------
   if (!Array.isArray(config.proxies)) config.proxies = [];
-
+  
   if (!config.proxies.some((p) => p.name === NODE_NAME)) {
     config.proxies.push({
       name: NODE_NAME,
@@ -19,12 +17,12 @@ function main(config) {
       "auth-key": TAILSCALE_AUTH_KEY,
       hostname: TAILSCALE_HOSTNAME,
       udp: true,
-      "accept-routes": true,
+      "accept-routes": true, 
       "state-dir": "tailscale-state",
     });
   }
 
-  // ---------- 2. 挂进已有的手动选择/代理组 ----------
+  // ---------- 2. 将节点挂载进手动选择或代理组 ----------
   if (Array.isArray(config["proxy-groups"])) {
     config["proxy-groups"].forEach((g) => {
       if (
@@ -38,53 +36,47 @@ function main(config) {
     });
   }
 
-  // ---------- 3. 路由规则：tailnet 流量走 Tailscale 节点 ----------
+  // ---------- 3. 定义短域名正则匹配规则 ----------
+  // 匹配所有不包含点号 `.` 的单标签域名（例如 nas, router, web 等）
+  const shortDomainRegex = "^[^.]+$";
+
+  // ---------- 4. 路由规则注入 ----------
   const tailscaleRules = [
-    `IP-CIDR,100.64.0.0/10,${NODE_NAME},no-resolve`,
-    `DOMAIN-SUFFIX,ts.net,${NODE_NAME}`,
+    `DOMAIN,localhost,DIRECT`,                           // 优先直连 localhost，防止系统保留短名被正则捕获并发送至 tailnet
+    `IP-CIDR,100.64.0.0/10,${NODE_NAME},no-resolve`,     // Tailscale CGNAT 官方网段
+    `DOMAIN-SUFFIX,ts.net,${NODE_NAME}`,                 // 完整 MagicDNS 域名直接走 Tailscale
+    `DOMAIN-REGEX,${shortDomainRegex},${NODE_NAME}`      // 【核心】拦截所有短域名，强制交由 Tailscale 出站处理
   ];
+  
   const oldRules = Array.isArray(config.rules) ? config.rules : [];
   config.rules = tailscaleRules.concat(
     oldRules.filter((r) => tailscaleRules.indexOf(r) === -1)
   );
 
-  // ---------- 4. DNS：修复 MagicDNS 解析逻辑 ----------
+  // ---------- 5. DNS 配置深度劫持 ----------
   if (!config.dns) config.dns = {};
 
+  // 5.1 过滤 Fake-IP：确保短域名获取的是 tailnet 的真实 100.x IP，避免与代理机制冲突
   if (!Array.isArray(config.dns["fake-ip-filter"])) {
     config.dns["fake-ip-filter"] = [];
   }
-  
-  // 【修复1】增加更严谨的通配符，防止部分内核版本对 +.ts.net 过滤遗漏
-  const tsFilters = ["+.ts.net", "*.ts.net", "ts.net"];
-  tsFilters.forEach(domain => {
-    if (config.dns["fake-ip-filter"].indexOf(domain) === -1) {
-      config.dns["fake-ip-filter"].push(domain);
+  const fakeIpFilters = ["+.ts.net", `regex:${shortDomainRegex}`];
+  fakeIpFilters.forEach(filter => {
+    if (config.dns["fake-ip-filter"].indexOf(filter) === -1) {
+      config.dns["fake-ip-filter"].push(filter);
     }
   });
 
+  // 5.2 DNS 解析策略：强制短域名的 DNS 解析走 MagicDNS 
   if (!config.dns["nameserver-policy"] || typeof config.dns["nameserver-policy"] !== "object") {
     config.dns["nameserver-policy"] = {};
   }
   
-  // 【修复2】第一性原理：必须显式声明 udp:// 和 53 端口。
-  // 原先的 "100.100.100.100#Node" 会被部分解析器退化为 TCP 请求或因特殊字符解析报错
-  const tsDnsServer = `udp://100.100.100.100:53#${NODE_NAME}`;
-  config.dns["nameserver-policy"]["+.ts.net"] = tsDnsServer;
-  config.dns["nameserver-policy"]["*.ts.net"] = tsDnsServer;
+  // 原有的 ts.net 后缀走 MagicDNS
+  config.dns["nameserver-policy"]["+.ts.net"] = `100.100.100.100#${NODE_NAME}`;
+  // 【核心】不带后缀的短域名同样交由 MagicDNS 解析
+  config.dns["nameserver-policy"][`regex:${shortDomainRegex}`] = `100.100.100.100#${NODE_NAME}`;
 
-  // ---------- 5. 别名（短名）访问映射 ----------
-  const TAILNET_HOSTS = {
-    // "短名": "100.x.y.z", 
-  };
-
-  if (Object.keys(TAILNET_HOSTS).length > 0) {
-    if (!config.hosts || typeof config.hosts !== "object") config.hosts = {};
-    Object.keys(TAILNET_HOSTS).forEach((name) => {
-      config.hosts[name] = TAILNET_HOSTS[name];
-    });
-    config.dns["use-hosts"] = true;
-  }
-
+  // 由于实现了自动解析，不再需要强行写入 config.hosts
   return config;
 }
