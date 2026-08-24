@@ -37,7 +37,7 @@ function main(config) {
 
   // 2. 构建并添加 Tailscale 出站节点
   const tailscaleProxy = {
-    name: NODE_NAME_1,
+    name: NODE_NAME,
     type: "tailscale",
     "auth-key": TAILSCALE_AUTH_KEY,
     hostname: TAILSCALE_HOSTNAME,
