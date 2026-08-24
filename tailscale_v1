@@ -1,75 +1,107 @@
-// Mihomo Tailscale + Fake-IP + gVisor TUN 覆写脚本
+/**
+ * Mihomo(Clash Meta) 覆写脚本 —— 为 fake-ip + TUN(gVisor) 配置接入 Tailscale
+ *
+ * 原理：不在系统层跑 tailscaled/建立第二个 TUN 设备，而是用 mihomo 原生的
+ *       `type: tailscale` 出站（内嵌 tsnet），把 Tailscale 当作一个"代理节点"。
+ *       好处：完全不需要和 mihomo 自己的 TUN 抢路由表 / 处理 route-exclude，
+ *       因为 tsnet 只是 mihomo 进程内部的一条出站连接，不产生系统网络接口。
+ *
+ * 适用：Clash Verge Rev / FlClash / Clash Nyanpasu 等支持
+ *       `function main(config) { ... return config }` 覆写脚本机制的客户端。
+ *
+ * 要求：mihomo 内核 >= 支持 tailscale 出站的版本（2026 年 5 月后的 alpha/release）。
+ */
+
 function main(config) {
-  // 1. 初始化基础对象
-  if (!config.proxies) config.proxies = [];
-  if (!config.rules) config.rules = [];
-  if (!config.dns) config.dns = {};
-  if (!config.tun) config.tun = {};
-
-  // 2. 强制配置 TUN 模块为 gVisor 模式
-  config.tun = {
-    ...config.tun,
-    enable: true,
-    stack: "gvisor", // 采用 gvisor 用户态网络栈
-    "dns-hijack": ["any:53", "tcp://any:53"],
-    "auto-route": true,
-    "auto-detect-interface": true
-  };
-
-  // 3. 配置 DNS 为 Fake-IP 模式
-  config.dns = {
-    ...config.dns,
-    enable: true,
-    "enhanced-mode": "fake-ip",
-    "fake-ip-range": "198.18.0.1/16"
-  };
-
-  // 4. 定义 Tailscale 代理节点
-  const tailscaleProxy = {
+  // ===================== 按需修改这一段 =====================
+  const TAILSCALE = {
     name: "Tailscale",
-    type: "tailscale",
-    hostname: "clash-mihomo", // Tailnet 中显示的设备名称
-    "auth-key": "tskey-auth-xxxxxxxxxxxx", // 替换为你的 Tailscale 授权密钥（首次认证使用）
-    // "control-url": "https://headscale.example.com", // 若使用 Headscale，取消注释并填入地址
-    "state-dir": "./tailscale", // 关键：持久化目录，确保证书与网络状态不丢失
-    ephemeral: false, // 关键：保持节点永久有效，不随离线自动销毁
-    udp: true, // 必须开启 UDP 以保证 WireGuard 隧道性能
-    "accept-routes": true // 接收 Tailnet 中 Subnet Router 发布的内网子网路由
-    // "exit-node": "100.64.0.1", // 若需使用指定 Exit Node 出口网关可配置
+    // 在 Tailscale 后台显示的设备名，尽量固定不要每次改，
+    // 否则容易在后台产生"重复设备/需要改名"的冲突（这也是持久化运行的关键点之一）。
+    hostname: "mihomo-home",
+    // 首次登录用的 auth key。留空则首次启动时去核心日志里找交互式登录链接手动授权。
+    // 建议在 Tailscale 后台生成 reusable（可复用）且 Key Expiry 已关闭 的 key，
+    // 并把这台设备的 Key Expiry 也关掉，否则跑几个月后会被强制下线要求重新登录。
+    authKey: "",
+    // tsnet 的状态目录：必须是【绝对路径】+【长期存在、不会被清空】的目录。
+    // 千万不要指向订阅缓存目录/临时目录——一旦被清空，设备身份丢失，
+    // 重启后会在 Tailscale 后台变成"新设备"，即所谓 cloned device 冲突。
+    stateDir: "/etc/mihomo/tailscale-state",
+    // 如果直连 Tailscale 控制面/DERP 不稳定（比如被墙），
+    // 填一个已有节点或策略组名称，走该代理去连 Tailscale 官方服务器。
+    // 留空则直连。
+    dialerProxy: "",
   };
 
-  // 移除旧的同名节点并注入新节点
-  config.proxies = config.proxies.filter(p => p.name !== tailscaleProxy.name);
-  config.proxies.push(tailscaleProxy);
+  // tailnet 域名后缀：默认官方 MagicDNS 用 ts.net；
+  // 如果是自建 headscale 且用了自定义 base domain，把它也加进来。
+  const tailnetDomainSuffixes = ["ts.net"];
 
-  // 5. 自动将 Tailscale 节点加入全局/默认策略组（可选）
-  if (Array.isArray(config["proxy-groups"])) {
-    config["proxy-groups"].forEach(group => {
-      if (group.name === "GLOBAL" || group.name === "PROXY") {
-        if (!group.proxies.includes(tailscaleProxy.name)) {
-          group.proxies.push(tailscaleProxy.name);
-        }
-      }
-    });
+  // 自定义域名 / 短域名 别名重定向：解决 MagicDNS 短名（比如 "nas"）
+  // 在 TUN 拦截 DNS 场景下拿不到 search-domain 后缀、导致无法解析的问题。
+  // 写法是"域名重定向"，重定向后的目标会继续按下面的 nameserver-policy 走 Tailscale 解析。
+  const hostAliases = {
+    // "nas": "nas.tskey-xxxx.ts.net",
+    // "nas.lan": "nas.tskey-xxxx.ts.net",
+  };
+  // ===========================================================
+
+  // ---- 1. proxies：幂等添加 tailscale 出站，避免每次刷新订阅重复添加 ----
+  config.proxies = config.proxies || [];
+  const already = config.proxies.some(p => p.name === TAILSCALE.name);
+  if (!already) {
+    const node = {
+      name: TAILSCALE.name,
+      type: "tailscale",
+      hostname: TAILSCALE.hostname,
+      "state-dir": TAILSCALE.stateDir,
+      ephemeral: false, // 非临时节点，配合持久化 state-dir 才能保住设备身份
+      udp: true,
+      "accept-routes": true,
+    };
+    if (TAILSCALE.authKey) node["auth-key"] = TAILSCALE.authKey;
+    if (TAILSCALE.dialerProxy) node["dialer-proxy"] = TAILSCALE.dialerProxy;
+    config.proxies.push(node);
   }
 
-  // 6. 注入 Tailscale 专属路由规则（置顶优先匹配）
-  const tailscaleRules = [
-    // Tailscale 默认 CGNAT IP 网段（no-resolve 防止反向 DNS 解析死锁）
-    "IP-CIDR,100.64.0.0/10,Tailscale,no-resolve",
-    
-    // Tailscale 官方 MagicDNS 域名后缀
-    "DOMAIN-SUFFIX,ts.net,Tailscale",
-    
-    // 自定义内网域名（请根据你的实际 Tailnet 自定义搜索域或内网域名修改）
-    "DOMAIN-SUFFIX,lan,Tailscale",
-    "DOMAIN-SUFFIX,local,Tailscale",
-    "DOMAIN-SUFFIX,internal.example.com,Tailscale"
-    
-    // 若 Tailnet 中配置了子网路由器（Subnet Router，例如 192.168.100.0/24），取消下一行注释：
-    // "IP-CIDR,192.168.100.0/24,Tailscale,no-resolve"
-  ];
+  // ---- 2. proxy-groups：顺手塞进"手动选择/漏网之鱼"类分组，方便面板里看状态 ----
+  config["proxy-groups"] = config["proxy-groups"] || [];
+  config["proxy-groups"].forEach(g => {
+    if (
+      Array.isArray(g.proxies) &&
+      /select|手动|漏网|fallback/i.test(g.name) &&
+      !g.proxies.includes(TAILSCALE.name)
+    ) {
+      g.proxies.push(TAILSCALE.name);
+    }
+  });
 
+  // ---- 3. DNS：fake-ip 模式下，tailnet 域名的"真实解析"要经由 Tailscale 出站 ----
+  // 100.100.100.100 是 Tailscale 的内置 DNS(MagicDNS)，只有连上 tailnet 后才可达，
+  // 所以必须用 `#节点名` 语法强制这条查询走 tsnet 这条出站去拨号。
+  config.dns = config.dns || {};
+  config.dns["nameserver-policy"] = config.dns["nameserver-policy"] || {};
+  tailnetDomainSuffixes.forEach(suffix => {
+    config.dns["nameserver-policy"][`+.${suffix}`] =
+      `100.100.100.100#${TAILSCALE.name}`;
+  });
+
+  // hosts：短域名/自定义别名重定向
+  if (Object.keys(hostAliases).length > 0) {
+    config.dns.hosts = Object.assign({}, config.dns.hosts, hostAliases);
+  }
+
+  // 注意：不要把 ts.net 加进 fake-ip-filter。fake-ip 模式下客户端拿到的仍是假 IP，
+  // mihomo 内部按规则转发时才会用上面 nameserver-policy 解析出的真实 IP 去连接，
+  // 这个流程本来就是 fake-ip 该有的工作方式，不需要让 ts.net "走真实 IP"。
+
+  // ---- 4. Rules：命中 tailnet 域名 / CGNAT 网段的流量丢给 Tailscale 出站 ----
+  // 插到规则列表最前面，保证优先级最高，不被前面的 GEOSITE/规则集抢先匹配掉。
+  config.rules = config.rules || [];
+  const tailscaleRules = [
+    ...tailnetDomainSuffixes.map(s => `DOMAIN-SUFFIX,${s},${TAILSCALE.name}`),
+    `IP-CIDR,100.64.0.0/10,${TAILSCALE.name},no-resolve`,
+  ];
   config.rules = [...tailscaleRules, ...config.rules];
 
   return config;
